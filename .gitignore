@@ -1,5 +1,2 @@
-*.pyc
-.idea
-.ipynb_checkpoints/
-
+*.py[cdo]
 /logs/
