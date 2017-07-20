@@ -1,70 +1,60 @@
-from apc_data import APCDataSet, APCSample
-from probabilistic_segmentation import ProbabilisticSegmentationRF, ProbabilisticSegmentationBP
-import pickle
+#!/usr/bin/env python
+
 import os
+import os.path as osp
 
 import fcn
-import matplotlib.pyplot as plt
 import numpy as np
-import copy
+import skimage.io
+import tqdm
+
+from rbo_seg.apc_data import APCDataSet
+from rbo_seg.apc_data import APCSample
+from rbo_seg.seg import ProbabilisticSegmentationBP
 
 
-def evaluate(bp, test_data):
+def evaluate(bp, test_data, with_candidates=False):
+    imgs = []
     lbl_preds = []
     lbl_trues = []
-    for sample in test_data.samples:
-        sample.candidate_objects = test_data.object_names
+    for sample in tqdm.tqdm(test_data.samples):
+        if not with_candidates:
+            sample.candidate_objects = test_data.object_names
 
-        if len(sample.object_masks) == 0:
-            continue
-        pred_target = sample.object_masks.keys()[0]
-        if pred_target == 'shelf':
-            if len(sample.object_masks.keys()) == 1:
-                continue
-            pred_target = sample.object_masks.keys()[1]
-        bp.predict(sample, pred_target)
+        bp.predict(sample, desired_object='shelf')  # no candidates
 
-        images = []
-        for _object in test_data.object_names:
-            if _object in bp.posterior_images_smooth:
-                images.append(bp.posterior_images_smooth[_object])
-            else:
-                raise ValueError
-                images.append(np.zeros_like(images[0]))
-        pred = np.argmax(np.array(images), axis=0).astype(np.int32)
+        proba_img = []
+        for obj in test_data.object_names:
+            proba_img.append(bp.posterior_images_smooth[obj])
+        lbl_pred = np.argmax(proba_img, axis=0).astype(np.int32)
 
-        true = np.zeros_like(pred)
+        lbl_true = np.zeros_like(lbl_pred)
         for obj_id, obj in enumerate(test_data.object_names):
             if obj != 'shelf' and obj in sample.object_masks:
-                true[sample.object_masks[obj]] = obj_id
+                lbl_true[sample.object_masks[obj]] = obj_id
 
-        pred[~sample.bin_mask] = -1
-        true[~sample.bin_mask] = -1
+        lbl_pred[~sample.bin_mask] = -1
+        lbl_true[~sample.bin_mask] = -1
 
-        lbl_preds.append(pred)
-        lbl_trues.append(true)
+        img = skimage.io.imread(sample.file_prefix + '.jpg')
+        x1, y1 = sample.bounding_box['x'], sample.bounding_box['y']
+        x2 = x1 + sample.bounding_box['w']
+        y2 = y1 + sample.bounding_box['h']
+        img = img[y1:y2, x1:x2]
 
-        # import mvtk
-        # import cv2
-        # image = cv2.imread(sample.file_prefix + '.jpg')[:, :, ::-1]
-        # x1 = sample.bounding_box['x']
-        # y1 = sample.bounding_box['y']
-        # x2 = x1 + sample.bounding_box['w']
-        # y2 = y1 + sample.bounding_box['h']
-        # image = image[y1:y2, x1:x2]
-        # image[~sample.bin_mask] = 0
-        # #
-        # pred_viz = mvtk.image.label2rgb(pred)
-        # true_viz = mvtk.image.label2rgb(true)
-        # #
-        # pred_viz = mvtk.image.tile([image, pred_viz], shape=(1, 2))
-        # true_viz = mvtk.image.tile([image, true_viz], shape=(1, 2))
-        # viz = mvtk.image.tile([true_viz, pred_viz], shape=(2, 1))
-        # #
-        # cv2.imshow('viz', viz[:, :, ::-1])
-        # cv2.waitKey(0)
+        imgs.append(img)
+        lbl_preds.append(lbl_pred)
+        lbl_trues.append(lbl_true)
+
     n_class = len(test_data.object_names)
-    return fcn.utils.label_accuracy_score(lbl_trues, lbl_preds, n_class)
+    acc, acc_cls, mean_iu, fwavacc = fcn.utils.label_accuracy_score(
+        lbl_trues, lbl_preds, n_class)
+    print('Acc: %.2f' % (acc * 100))
+    print('AccCls: %.2f' % (acc_cls * 100))
+    print('MeanIU: %.2f' % (mean_iu * 100))
+    print('FWAVACC: %.2f' % (fwavacc * 100))
+
+    return imgs, lbl_trues, lbl_preds
 
 
 def create_dataset(dataset_path):
@@ -82,17 +72,27 @@ def create_dataset(dataset_path):
     for file_prefix in data_file_prefixes:
         dataset.samples.append(
             APCSample(data_2016_prefix=file_prefix,
-                        labeled=True, is_2016=True, infer_shelf_mask=True))
+                      labeled=True, is_2016=True, infer_shelf_mask=True))
     return dataset
 
 
+here = osp.dirname(osp.abspath(__file__))
+
+
 def main():
-    dataset_path = '/home/wkentaro/data/datasets/APC2016/APC2016rbo'
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        '--out', default=osp.join(here, 'logs/visualizations_evaluate'))
+    args = parser.parse_args()
+
+    out = args.out
+
+    dataset_path = osp.expanduser('~/data/datasets/APC2016/APC2016rbo')
     dataset = create_dataset(dataset_path)
-    dataset_train, dataset_valid = dataset.split_simple(portion_training=0.7)
+    dataset_train, dataset_test = dataset.split_simple(portion_training=0.7)
 
     params = {
-        'use_features': ['color'],
+        'use_features': ['color', 'edge'],
         'segmentation_method': "max_smooth",
         'selection_method': "max_smooth",
         'make_convex': True,
@@ -100,13 +100,23 @@ def main():
         'do_greedy_resegmentation': True,
     }
     clf = ProbabilisticSegmentationBP(**params)
+    print('Fitting the segmenter.')
     clf.fit(dataset_train)
-    acc, acc_cls, mean_iu, fwavacc = evaluate(clf, dataset_valid)
 
-    print 'trained only by color features acc ', acc
-    print 'trained only by color features acc_cls ', acc_cls
-    print 'trained only by color features mean_iu ', mean_iu
-    print 'trained only by color features fwavcc ', fwavacc
+    print('Evaluating with test set.')
+    imgs, lbl_trues, lbl_preds = evaluate(
+        clf, dataset_test, with_candidates=False)
+
+    print('Saving visualizations: %s' % out)
+    if not osp.exists(out):
+        os.makedirs(out)
+    for i, (img, lbl_true, lbl_pred) in \
+            enumerate(zip(imgs, lbl_trues, lbl_preds)):
+        viz = fcn.utils.visualize_segmentation(
+            lbl_true=lbl_true, lbl_pred=lbl_pred, img=img,
+            n_class=len(dataset_test.object_names))
+        out_file = osp.join(out, '%06d.jpg' % i)
+        skimage.io.imsave(out_file, viz)
 
 
 if __name__ == '__main__':
